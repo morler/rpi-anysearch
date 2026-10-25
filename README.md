@@ -1,7 +1,7 @@
 # rpi-anysearch
 
-把 [AnySearch](https://anysearch.com) 的搜索能力接进 rpi：通用联网搜索、17 个垂直领域
-的结构化搜索、最多 5 条查询的并发批量搜索、以及 URL 正文抽取（转 Markdown）。
+把 [AnySearch](https://anysearch.com) 的搜索能力接进 rpi：通用联网搜索、16 个垂直领域的
+结构化搜索、最多 5 条查询的并发批量搜索、以及 URL 正文抽取（转 Markdown）。
 
 这是 rpi 的 Rust `cdylib` 扩展，只依赖 `rpi-plugin-sdk`、`serde_json` 和 `ureq`（rustls），
 **不需要**修改 rpi 核心，**不需要** Python / Node / jq / curl。
@@ -9,12 +9,15 @@
 ## 安装
 
 ```bash
-rpi install rpi-anysearch                # 预编译包
-rpi install rpi-anysearch --path . --force  # 本地构建
+# 从源码构建（目前唯一可用方式，尚未发布到 crates.io）
+git clone https://github.com/morler/rpi-anysearch.git
+cd rpi-anysearch
+rpi install --path . --force
+
 rpi uninstall rpi-anysearch              # 卸载
 ```
 
-支持 Linux、macOS、Windows。
+需要 Rust 1.78+ 与 rpi 0.8。支持 Linux、macOS、Windows。
 
 ## 模型看到的工具
 
@@ -25,7 +28,7 @@ rpi uninstall rpi-anysearch              # 卸载
 | `anysearch_batch_search` | 最多 5 条查询并发；共享 `tag`/`params` 自动注入，结果按输入顺序返回，单条失败不影响其它 |
 | `anysearch_extract` | 抓取网页正文并转 Markdown |
 
-行为与参考实现 `/var/home/msc802/code/tools/anysearch-cli`（`anysearch search|batch_search|extract|get_sub_domains`）一致：
+行为与 AnySearch 官方 CLI 的 `search|batch_search|extract|get_sub_domains` 一致：
 
 - 端点 `POST /v1/search`、`GET /v1/sub-domains`、`POST /v1/extract`，默认 `https://api.anysearch.com`。
 - 校验规则同样对齐：`domain` 必须配 `sub_domain`；`domain` 必须是 `tag`/`sub_domain` 的前缀；
@@ -39,7 +42,7 @@ rpi uninstall rpi-anysearch              # 卸载
 工具参数 api_key  >  .env (ANYSEARCH_API_KEY)  >  环境变量 ANYSEARCH_API_KEY  >  匿名
 ```
 
-匿名可用，但速率限制更低。`.env` 的查找顺序（先命中优先）：
+匿名可用，但速率限制更低。在 [anysearch.com](https://anysearch.com) 控制台申请 key。`.env` 的查找顺序（先命中优先）：
 
 1. 工具调用的 `cwd`（宿主注入的 `__rpi.cwd`）下的 `.env`
 2. rpi 进程当前目录下的 `.env`
@@ -119,3 +122,7 @@ rpi install --path . --force   # 干净安装路径
   anysearch 控制台完成。
 - 不缓存搜索结果：每次调用都发真实请求。
 - 不提供输出格式参数：输出固定为 Markdown。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。
