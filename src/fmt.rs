@@ -329,6 +329,74 @@ mod tests {
     }
 
     #[test]
+    fn extract_keeps_a_fixed_section_order() {
+        let text = extract_response(&serde_json::json!({
+            "data": {
+                "title": "Doc",
+                "url": "https://e.x",
+                "content": "a\n\nb"
+            }
+        }));
+        let warning = text.find("> **External page content (untrusted):**");
+        let title = text.find("## Doc");
+        let source = text.find("**Source**: https://e.x");
+        let rule = text.find("\n---\n");
+        let body = text.find("> a");
+        // 顺序是结论而非细节:警告必须在最前,正文必须在分隔线之后。
+        assert!(warning.is_some(), "{text}");
+        assert!(warning < title, "{text}");
+        assert!(title < source, "{text}");
+        assert!(source < rule, "{text}");
+        assert!(rule < body, "{text}");
+        assert_eq!(text.matches("\n---\n").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn extract_body_stays_inside_the_quote_block() {
+        let text = extract_response(&serde_json::json!({
+            "data": {"content": "line one\n\nline three"}
+        }));
+        let (_, body) = text
+            .split_once("\n---\n")
+            .expect("body separated by a rule");
+        // 每一行正文都必须是引用行;空行写成单独的 `>`,不能是真空行
+        // (真空行会让后续内容重新回到顶格,逃出引用块)。
+        for line in body.lines().filter(|line| !line.is_empty()) {
+            assert!(line.starts_with('>'), "escaped line: {line:?} in {body:?}");
+        }
+        assert!(
+            body.contains(">\n"),
+            "blank body lines must be `>`: {body:?}"
+        );
+        assert!(
+            !body.contains("\n\n"),
+            "no bare blank line allowed: {body:?}"
+        );
+    }
+
+    #[test]
+    fn inline_collapses_newlines_and_runs_of_space() {
+        // 换行是伪造标题/分隔线的唯一手段,必须被折叠成空格。
+        assert_eq!(inline("a\nb"), "a b");
+        assert_eq!(inline("a\r\n\r\nb"), "a b");
+        assert_eq!(inline("a   \t b"), "a b");
+        assert_eq!(inline("  padded  "), "padded");
+        assert!(!inline("x\n---\ny").contains('\n'));
+    }
+
+    #[test]
+    fn finish_lines_trims_trailing_whitespace_to_one_newline() {
+        assert_eq!(finish_lines(vec!["a".into(), "".into()]), "a\n");
+        assert_eq!(finish_lines(vec!["a  ".into(), " \t".into()]), "a\n");
+        assert_eq!(finish_lines(vec!["a".into()]), "a\n");
+        // 内部空行不受裁剪影响。
+        assert_eq!(
+            finish_lines(vec!["a".into(), "".into(), "b".into()]),
+            "a\n\nb\n"
+        );
+    }
+
+    #[test]
     fn batch_failure_mentions_request_id() {
         assert_eq!(batch_failure("boom", ""), "Search failed: boom");
         assert_eq!(

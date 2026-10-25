@@ -25,33 +25,40 @@ pub fn load_env(cwd_hint: Option<&str>) -> HashMap<String, String> {
                 continue;
             }
         };
-        // BOM 只在整文件开头;先去掉,免得它混进第一个 key。
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key
-                .trim()
-                .strip_prefix("export ")
-                .unwrap_or(key.trim())
-                .trim();
-            let Some(value) = parse_env_value(value) else {
-                continue;
-            };
-            if key.is_empty() {
-                continue;
-            }
-            // 空值也要保留:`KEY=` 表示"显式置空",这对 `ANYSEARCH_API_KEY=`
-            // (强制匿名)是有意义的状态。
-            map.entry(key.to_string()).or_insert(value);
-        }
+        merge_env_text(&mut map, &text);
     }
     map
+}
+
+/// 把一个 `.env` 文件的内容并入 `map`;已存在的 key 保持首次出现的值。
+///
+/// 独立成函数是为了能测"先命中优先"这类语义,而不必去动进程 cwd / HOME。
+fn merge_env_text(map: &mut HashMap<String, String>, text: &str) {
+    // BOM 只在整文件开头;先去掉,免得它混进第一个 key。
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key
+            .trim()
+            .strip_prefix("export ")
+            .unwrap_or(key.trim())
+            .trim();
+        let Some(value) = parse_env_value(value) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        // 空值也要保留:`KEY=` 表示"显式置空",这对 `ANYSEARCH_API_KEY=`
+        // (强制匿名)是有意义的状态。
+        map.entry(key.to_string()).or_insert(value);
+    }
 }
 
 /// 解析 `.env` 右侧的原始值:剥离一对匹配引号,未加引号时去掉行内注释。
@@ -78,20 +85,31 @@ fn parse_env_value(raw: &str) -> Option<String> {
 }
 
 fn candidates(cwd_hint: Option<&str>) -> Vec<PathBuf> {
+    candidates_with(cwd_hint, std::env::current_dir().ok(), home_dir())
+}
+
+/// 候选路径：工具 cwd → 进程 cwd → `~/.rpi/anysearch.env`，重复路径只留一次。
+///
+/// 进程 cwd 与 HOME 作为参数传入，否则这两个全局状态会让顺序/去重无法测试。
+fn candidates_with(
+    cwd_hint: Option<&str>,
+    process_cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    let push = |path: PathBuf, paths: &mut Vec<PathBuf>| {
+    let mut push = |path: PathBuf| {
         if !paths.contains(&path) {
             paths.push(path);
         }
     };
     if let Some(cwd) = cwd_hint.filter(|cwd| !cwd.is_empty()) {
-        push(PathBuf::from(cwd).join(".env"), &mut paths);
+        push(PathBuf::from(cwd).join(".env"));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        push(cwd.join(".env"), &mut paths);
+    if let Some(cwd) = process_cwd {
+        push(cwd.join(".env"));
     }
-    if let Some(home) = home_dir() {
-        push(home.join(".rpi").join("anysearch.env"), &mut paths);
+    if let Some(home) = home {
+        push(home.join(".rpi").join("anysearch.env"));
     }
     paths
 }
@@ -407,6 +425,67 @@ mod tests {
         assert_eq!(parse_env_value("value # note").unwrap(), "value");
         assert_eq!(parse_env_value("abc#def").unwrap(), "abc#def");
         assert_eq!(parse_env_value("").unwrap(), "");
+    }
+
+    #[test]
+    fn env_candidates_keep_priority_order() {
+        let paths = candidates_with(
+            Some("/work/project"),
+            Some(PathBuf::from("/work/project")),
+            Some(PathBuf::from("/home/u")),
+        );
+        // 工具 cwd 与进程 cwd 相同时只保留一份。
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/work/project/.env"),
+                PathBuf::from("/home/u/.rpi/anysearch.env"),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_candidates_skip_absent_sources() {
+        let paths = candidates_with(Some("/a"), Some(PathBuf::from("/b")), None);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/a/.env"), PathBuf::from("/b/.env"),]
+        );
+
+        // 空 cwd 提示等同于未提供，避免把 `.env` 当成当前目录。
+        let paths = candidates_with(Some(""), None, Some(PathBuf::from("/home/u")));
+        assert_eq!(paths, vec![PathBuf::from("/home/u/.rpi/anysearch.env")]);
+
+        assert!(candidates_with(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn merge_env_text_keeps_the_first_occurrence() {
+        let mut map = HashMap::new();
+        merge_env_text(&mut map, "ANYSEARCH_API_KEY=first\nOTHER=1\n");
+        // 后续文件不得覆盖已加载的值。
+        merge_env_text(&mut map, "ANYSEARCH_API_KEY=second\nOTHER=2\nTHIRD=3\n");
+        assert_eq!(
+            map.get("ANYSEARCH_API_KEY").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(map.get("OTHER").map(String::as_str), Some("1"));
+        assert_eq!(map.get("THIRD").map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn merge_env_text_ignores_noise_but_keeps_explicit_empties() {
+        let mut map = HashMap::new();
+        merge_env_text(
+            &mut map,
+            "\u{feff}# comment\n\nexport KEY=value\nNOEQUALS\n=orphan\nEMPTY=\n",
+        );
+        assert_eq!(map.get("KEY").map(String::as_str), Some("value"));
+        // `KEY=` 是"显式置空"，必须保留而不是丢弃。
+        assert_eq!(map.get("EMPTY").map(String::as_str), Some(""));
+        assert!(!map.contains_key("NOEQUALS"));
+        assert!(!map.contains_key(""));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

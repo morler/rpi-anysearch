@@ -152,6 +152,13 @@ fn host_cwd(params: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 构造 HTTP 客户端。
+///
+/// `base_url` 与 `api_key` 都可以来自工具参数，因此请求目标最终由调用方（模型）决定。
+/// 这是**刻意保留的能力**（私有网关、自建代理需要它），安全保障不在这里，而在
+/// `env::Settings::allows_auth()`：从环境或 `.env` 继承来的 key 只允许发往官方 host，
+/// 想让 key 发往自定义 endpoint 必须由调用方显式传 `api_key`。
+/// 同时 `env::base_url()` 会拒绝 `http://`、空 host、userinfo 与 `file://`。
 fn client_for(params: &Value) -> Result<Client, String> {
     Client::from_env(
         host_cwd(params).as_deref(),
