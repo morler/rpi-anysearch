@@ -57,15 +57,18 @@ rpi uninstall rpi-anysearch              # 卸载
 不可信内容规则）交给宿主，并落盘到：
 
 ```
-~/.rpi/agent/anysearch/SKILL.md      # RPI_CODING_AGENT_DIR 可覆盖前缀
+~/.rpi/agent/skills/anysearch/SKILL.md      # RPI_CODING_AGENT_DIR 可覆盖前缀
 ```
 
-路径刻意**不放在** `<agent_dir>/skills/` 下：那个目录会被宿主静态扫描，插件再返回同一份
-文件就会以同一个 skill 名字注册两次，每次启动都打一条 collision 警告。写在这里则只有
-`resources_discover` 这一个入口。目录名必须是 skill 名（`anysearch`），否则加载器会以
-`name "anysearch" does not match parent directory` 拒绝它。
+这个位置就是宿主静态扫描 skill 的目录，刻意让两者指向**同一个文件**：实测 rpi 0.8.5 在
+同名 skill 出现两次时按名字静默去重（不打任何警告），所以只注册一次。反过来，把副本放到
+`skills/` 之外会让用户手动拷贝的旧版本静默胜出，插件更新永远不生效。
 
-内容变化时才重写。落盘失败不影响工具本身，只是不会自动注入技能说明。
+目录名必须是 skill 名（`anysearch`），否则加载器会以 `name "anysearch" does not match
+parent directory` 拒绝它。
+
+内容变化时才重写（tmp + rename 原子替换）。落盘失败不影响工具本身，只是不会自动注入
+技能说明。
 
 `/anysearch` 命令可离线打印同一份接口参考（不联网、不需要 key）。
 

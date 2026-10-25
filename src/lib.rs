@@ -7,12 +7,10 @@
 //! - `anysearch_get_sub_domains`：垂直领域目录（垂直搜索前必查）
 //!
 //! 另外通过 `resources_discover` 把一个 `SKILL.md` 分发给宿主，并写入
-//! `<agent_dir>/anysearch/SKILL.md`（`agent_dir` 默认 `~/.rpi/agent`，可用
+//! `<agent_dir>/skills/anysearch/SKILL.md`（`agent_dir` 默认 `~/.rpi/agent`，可用
 //! `RPI_CODING_AGENT_DIR` 覆盖），让模型知道各工具的使用顺序（先发现
-//! sub_domain 再搜索）。
-//!
-//! 注意这个位置**故意**不在 `<agent_dir>/skills/` 之下：那个目录由宿主静态扫描，
-//! 放一份副本会导致同名 skill 注册两次并在每次启动时告警。
+//! sub_domain 再搜索）。这个路径就是宿主静态扫描 skill 的目录：两者指向同一个
+//! 文件时宿主按名去重、只注册一次，插件更新会真正生效。
 
 // `export_plugin!` 生成的入口会 deref 宿主传入的指针，lint 看不到宏展开。
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -136,12 +134,13 @@ fn agent_dir() -> Option<PathBuf> {
 
 /// 解析 skill 落盘路径；无法确定绝对 agent 目录时返回 `None`。
 ///
-/// Deliberately NOT under `<agent_dir>/skills`: that directory is scanned
-/// statically by the host, so a copy there would register the same skill
-/// name twice and emit a collision warning on every startup. The parent
-/// directory must be the skill name, or the loader rejects the metadata.
+/// 写在 `<agent_dir>/skills/anysearch/SKILL.md`，也就是宿主静态扫描的目录。
+/// 这与“把副本放到扫描目录会重复注册”的直觉相反，但实测（rpi 0.8.5）是：
+/// 宿主按 skill 名去重，**不告警**，静态扫描的副本与 `resources_discover`
+/// 返回的路径指向同一个文件时只会注册一次。反过来，放到 `skills/` 之外会让
+/// 用户手拷贝的旧副本静默胜出，插件更新永远不生效。
 fn skill_path() -> Option<PathBuf> {
-    agent_dir().map(|dir| dir.join("anysearch").join("SKILL.md"))
+    agent_dir().map(|dir| dir.join("skills").join("anysearch").join("SKILL.md"))
 }
 
 fn install_skill(path: &Path) -> std::io::Result<()> {
@@ -186,20 +185,27 @@ mod tests {
     }
 
     #[test]
-    fn skill_path_is_outside_the_statically_scanned_dir() {
-        // `<agent_dir>/skills` is loaded by the host on its own; writing there
-        // would duplicate the skill name and log a collision every start.
+    fn skill_path_lives_in_the_scanned_skills_dir() {
+        // 必须落在宿主静态扫描的 `skills/<name>/SKILL.md`：与 `resources_discover`
+        // 返回的路径是同一个文件时，宿主按名去重只注册一次（实测 rpi 0.8.5），
+        // 因此内容是插件写的那份而不是用户手拷贝的旧版本。
         if let (Some(path), Some(skills_dir)) =
             (skill_path(), agent_dir().map(|dir| dir.join("skills")))
         {
-            assert!(!path.starts_with(skills_dir), "{}", path.display());
+            assert!(path.starts_with(&skills_dir), "{}", path.display());
+            assert_eq!(
+                path.parent().and_then(|parent| parent.file_name()),
+                Some(std::ffi::OsStr::new("anysearch")),
+                "the parent directory must be the skill name: {}",
+                path.display()
+            );
         }
     }
 
     #[test]
     fn install_skill_writes_via_rename() {
         let dir = std::env::temp_dir().join(format!("anysearch-skill-{}", std::process::id()));
-        let path = dir.join("anysearch").join("SKILL.md");
+        let path = dir.join("skills").join("anysearch").join("SKILL.md");
         install_skill(&path).unwrap();
         assert!(path.exists());
         // 临时文件不应残留。
