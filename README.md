@@ -97,7 +97,7 @@ parent directory` 拒绝它。
 
 ```bash
 cargo build                    # cdylib 给宿主，rlib 给测试
-cargo test                     # 34 个单测，不需要宿主也不需要 key
+cargo test                     # 58 个单测，不需要宿主也不需要 key
 cargo test -- --ignored        # 另 1 个真实 API 冒烟测试（需要 ANYSEARCH_API_KEY）
 cargo fmt --check && cargo clippy --all-targets
 rpi dev --no-watch             # 编译加载一次
@@ -110,7 +110,7 @@ rpi install --path . --force   # 干净安装路径
 | --- | --- |
 | `src/lib.rs` | `export_plugin!` 入口、四个工具注册、`resources_discover`、`/anysearch` 命令 |
 | `src/tool.rs` | 工具生命周期（`spawn_job`/`poll`/`cancel`/`destroy`）、参数校验、工具 schema |
-| `src/api.rs` | HTTP 客户端、错误渲染、请求体构造与结果规范化 |
+| `src/api.rs` | HTTP 客户端、`Transport` 抽象（可注入的传输层）、错误渲染、请求体构造与结果规范化 |
 | `src/fmt.rs` | 搜索结果 / 领域目录 / 正文抽取的 Markdown 渲染 |
 | `src/env.rs` | `.env` 加载、`params` 与 domain 列表解析 |
 | `src/doc.rs` | 接口参考（约会用）与 `SKILL.md` 内容 |

@@ -4,6 +4,7 @@ use crate::consts::CLIENT_HEADER;
 use crate::env;
 use serde_json::{json, Map, Value};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 响应体读取上限:防止恶意/异常响应耗尽宿主内存。
@@ -51,21 +52,105 @@ impl std::error::Error for ApiError {}
 
 #[derive(Clone)]
 pub struct Client {
-    agent: ureq::Agent,
-    base_url: String,
+    transport: Arc<dyn Transport>,
     api_key: String,
 }
 
-impl Client {
-    pub fn new(base_url: &str, api_key: &str) -> Self {
+/// HTTP 方法。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    Post,
+    Get,
+}
+
+/// 一次出站请求的描述,还没落到具体网络实现上。
+///
+/// `query` 刻意保持结构化而不是预先拼进 `path`:百分号编码交给传输层做,
+/// 免得在这儿引入编码回归。
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub method: Method,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+}
+
+/// 传输层返回的原始响应(尚未解析信封)。
+#[derive(Clone, Debug)]
+pub struct Response {
+    pub status: u16,
+    pub body: String,
+}
+
+/// 出站请求的唯一出口。
+///
+/// 抽出来是为了让 `run_*` 的逻辑、并发与鉴权规则能在不发真 HTTP 的情况下被测到;
+/// 真实 I/O、超时与响应体积上限全部集中在 [`UreqTransport`]。
+pub trait Transport: Send + Sync {
+    fn send(&self, request: Request) -> Result<Response, ApiError>;
+}
+
+/// 真实的 ureq 传输:负责 URL 拼接、query 附加、超时与响应体积上限。
+struct UreqTransport {
+    agent: ureq::Agent,
+    base_url: String,
+}
+
+impl UreqTransport {
+    fn new(base_url: &str) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
+            // 4xx/5xx 也要读完响应体,否则拿不到信封里的 message/request_id。
             .http_status_as_error(false)
             .build()
             .into();
         Self {
             agent,
             base_url: base_url.trim_end_matches('/').to_string(),
+        }
+    }
+}
+
+impl Transport for UreqTransport {
+    fn send(&self, request: Request) -> Result<Response, ApiError> {
+        let url = format!("{}{}", self.base_url, request.path);
+        let result = match request.method {
+            Method::Post => {
+                let mut call = self.agent.post(&url);
+                for (name, value) in &request.headers {
+                    call = call.header(name.as_str(), value.as_str());
+                }
+                finish(call.send(request.body.as_deref().unwrap_or("").as_bytes()))
+            }
+            Method::Get => {
+                let mut call = self.agent.get(&url);
+                for (name, value) in &request.headers {
+                    call = call.header(name.as_str(), value.as_str());
+                }
+                for (name, value) in &request.query {
+                    call = call.query(name.as_str(), value.clone());
+                }
+                finish(call.call())
+            }
+        };
+        result
+    }
+}
+
+impl Client {
+    pub fn new(base_url: &str, api_key: &str) -> Self {
+        Self {
+            transport: Arc::new(UreqTransport::new(base_url)),
+            api_key: api_key.to_string(),
+        }
+    }
+
+    /// 用注入的传输层构造(只给测试用:真实路径不经过这里)。
+    #[cfg(test)]
+    pub fn with_transport(transport: Arc<dyn Transport>, api_key: &str) -> Self {
+        Self {
+            transport,
             api_key: api_key.to_string(),
         }
     }
@@ -88,40 +173,54 @@ impl Client {
         Ok(Self::new(&settings.base_url, api_key))
     }
 
-    pub fn post(&self, path: &str, payload: &Value) -> Result<Value, ApiError> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self
-            .agent
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("X-Anysearch-Client", CLIENT_HEADER);
-        if !self.api_key.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.api_key));
+    /// 组装带鉴权与客户端标识的请求头。key 为空时**不发** `Authorization`,
+    /// 而不是发一个空 Bearer。
+    fn headers(&self, content_type: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = vec![("X-Anysearch-Client".to_string(), CLIENT_HEADER.to_string())];
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type".to_string(), content_type.to_string()));
         }
+        if !self.api_key.is_empty() {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ));
+        }
+        headers
+    }
+
+    pub fn post(&self, path: &str, payload: &Value) -> Result<Value, ApiError> {
         let body = serde_json::to_string(payload)
             .map_err(|error| ApiError::new(format!("Failed to serialize request body: {error}")))?;
-        finish(request.send(body.as_bytes()))
+        let response = self.transport.send(Request {
+            method: Method::Post,
+            path: path.to_string(),
+            query: Vec::new(),
+            headers: self.headers(Some("application/json")),
+            body: Some(body),
+        })?;
+        parse_envelope(response.status, &response.body)
     }
 
     pub fn get(&self, path: &str, params: &[(&str, String)]) -> Result<Value, ApiError> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self
-            .agent
-            .get(&url)
-            .header("X-Anysearch-Client", CLIENT_HEADER);
-        if !self.api_key.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.api_key));
-        }
-        for (name, value) in params {
-            request = request.query(name, value.clone());
-        }
-        finish(request.call())
+        let response = self.transport.send(Request {
+            method: Method::Get,
+            path: path.to_string(),
+            query: params
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), value.clone()))
+                .collect(),
+            headers: self.headers(None),
+            body: None,
+        })?;
+        parse_envelope(response.status, &response.body)
     }
 }
 
+/// 把 ureq 的结果与响应体转成 [`Response`]:错误映射、状态码与体积上限都在这里。
 fn finish(
     result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
-) -> Result<Value, ApiError> {
+) -> Result<Response, ApiError> {
     let response = match result {
         Ok(response) => response,
         Err(ureq::Error::Timeout(_)) => {
@@ -134,7 +233,7 @@ fn finish(
         }
     };
     let status = response.status().as_u16();
-    let text = response
+    let body = response
         .into_body()
         .into_with_config()
         .limit(MAX_RESPONSE_BYTES)
@@ -144,7 +243,7 @@ fn finish(
                 "Connection Error: unable to read the response body ({error})."
             ))
         })?;
-    parse_envelope(status, &text)
+    Ok(Response { status, body })
 }
 
 fn parse_envelope(status: u16, text: &str) -> Result<Value, ApiError> {
@@ -323,9 +422,165 @@ fn non_empty_str<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a st
         .filter(|value| !value.is_empty())
 }
 
+/// 测试用的传输层：记录每个请求，按注入的闭包回放响应。
+///
+/// 用 `cfg(test)` 门控，不进生产二进制，也不扩大公开 API。
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 回放闭包：拿到请求，给出响应或错误。
+    type Reply = Box<dyn Fn(&Request) -> Result<Response, ApiError> + Send + Sync>;
+
+    pub struct FakeTransport {
+        seen: Mutex<Vec<Request>>,
+        reply: Reply,
+    }
+
+    impl FakeTransport {
+        pub fn new(
+            reply: impl Fn(&Request) -> Result<Response, ApiError> + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                reply: Box::new(reply),
+            })
+        }
+
+        /// 已收到的请求（按到达顺序）。锁只持有到克隆为止，避免并发测试里死锁。
+        pub fn requests(&self) -> Vec<Request> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        pub fn client(self: &Arc<Self>, api_key: &str) -> Client {
+            Client::with_transport(Arc::clone(self) as Arc<dyn Transport>, api_key)
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn send(&self, request: Request) -> Result<Response, ApiError> {
+            self.seen.lock().unwrap().push(request.clone());
+            (self.reply)(&request)
+        }
+    }
+
+    /// 取某个请求头的值（大小写不敏感）。
+    pub fn header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+        request
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// 200 + 信封的成功响应。
+    pub fn ok(body: Value) -> Result<Response, ApiError> {
+        Ok(Response {
+            status: 200,
+            body: body.to_string(),
+        })
+    }
+
+    pub fn response(status: u16, body: Value) -> Result<Response, ApiError> {
+        Ok(Response {
+            status,
+            body: body.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::{header, ok, response, FakeTransport};
     use super::*;
+
+    #[test]
+    fn post_sends_json_and_client_header() {
+        let fake = FakeTransport::new(|_| ok(json!({"code": 0, "data": {}})));
+        let client = fake.client("as_sk_secret");
+        client
+            .post("/v1/search", &json!({ "query": "hi" }))
+            .unwrap();
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, Method::Post);
+        assert_eq!(request.path, "/v1/search");
+        assert_eq!(header(request, "content-type"), Some("application/json"));
+        assert_eq!(
+            header(request, "x-anysearch-client"),
+            Some(crate::consts::CLIENT_HEADER)
+        );
+        assert_eq!(
+            header(request, "authorization"),
+            Some("Bearer as_sk_secret")
+        );
+        assert_eq!(request.body.as_deref(), Some(r#"{"query":"hi"}"#));
+    }
+
+    #[test]
+    fn empty_key_omits_authorization() {
+        // 匿名调用不能发出空的 Bearer。
+        let fake = FakeTransport::new(|_| ok(json!({"code": 0, "data": {}})));
+        let client = fake.client("");
+        client.post("/v1/search", &json!({})).unwrap();
+        let requests = fake.requests();
+        assert_eq!(header(&requests[0], "authorization"), None);
+    }
+
+    #[test]
+    fn get_keeps_query_structured() {
+        let fake = FakeTransport::new(|_| ok(json!({"code": 0, "data": {}})));
+        let client = fake.client("");
+        client
+            .get(
+                "/v1/sub-domains",
+                &[
+                    ("domain", "finance".to_string()),
+                    ("domain", "health".to_string()),
+                ],
+            )
+            .unwrap();
+        let requests = fake.requests();
+        let request = &requests[0];
+        assert_eq!(request.method, Method::Get);
+        // 同名参数必须重复而非合并,且值不能预先拼进 path。
+        assert_eq!(
+            request.query,
+            vec![
+                ("domain".to_string(), "finance".to_string()),
+                ("domain".to_string(), "health".to_string()),
+            ]
+        );
+        assert_eq!(request.path, "/v1/sub-domains");
+        assert_eq!(header(request, "content-type"), None);
+        assert!(request.body.is_none());
+    }
+
+    #[test]
+    fn transport_error_is_mapped_to_the_shared_error_text() {
+        let fake =
+            FakeTransport::new(|_| Err(ApiError::new("Timeout: The API request timed out.")));
+        let client = fake.client("");
+        let error = client.post("/v1/search", &json!({})).unwrap_err();
+        assert_eq!(error.render(), "Timeout: The API request timed out.");
+    }
+
+    #[test]
+    fn http_error_status_is_parsed_from_the_body() {
+        // 4xx 也要把信封里的 message / request_id 带出来。
+        let fake = FakeTransport::new(|_| {
+            response(
+                400,
+                json!({"code": 4001, "message": "bad tag", "request_id": "req_9"}),
+            )
+        });
+        let client = fake.client("");
+        let error = client.post("/v1/search", &json!({})).unwrap_err();
+        assert_eq!(error.message, "bad tag");
+        assert_eq!(error.render(), "bad tag (request_id: req_9)");
+    }
 
     #[test]
     fn search_body_omits_absent_fields() {

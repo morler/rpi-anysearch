@@ -216,38 +216,54 @@ fn validate_domain(domain: Option<&str>) -> Result<(), String> {
     }
 }
 
-fn run_search(params: Value, cancel: &Cancel) -> Outcome {
+/// 取消检查：所有 `run_*` 与 `send_*` 的统一入口守卫。
+fn guard(cancel: &Cancel) -> Result<(), String> {
     if is_cancelled(cancel) {
         return Err("anysearch request cancelled".to_string());
     }
-    let query = str_field(&params, "query").ok_or("`query` is required")?;
-    let domain = str_field(&params, "domain");
+    Ok(())
+}
+
+/// 单条搜索的参数校验 → REST 请求体。不触网，因此可单测。
+fn prepare_search(params: &Value) -> Result<Value, String> {
+    let query = str_field(params, "query").ok_or("`query` is required")?;
+    let domain = str_field(params, "domain");
     validate_domain(domain)?;
     let tag = resolve_tag(
         domain,
-        str_field(&params, "tag"),
-        str_field(&params, "sub_domain"),
+        str_field(params, "tag"),
+        str_field(params, "sub_domain"),
     )?;
-    let parsed_params = parse_params_field(&params)?;
-    let zone = str_field(&params, "zone");
+    let parsed_params = parse_params_field(params)?;
+    let zone = str_field(params, "zone");
     if let Some(zone) = zone {
         if zone != "cn" && zone != "intl" {
             return Err("`zone` must be `cn` or `intl`".to_string());
         }
     }
-    let body = api::search_body(
+    Ok(api::search_body(
         query,
         tag.as_deref(),
         parsed_params.as_ref(),
         zone,
-        str_field(&params, "language"),
-        int_field(&params, "max_results"),
-    );
-    let client = client_for(&params)?;
+        str_field(params, "language"),
+        int_field(params, "max_results"),
+    ))
+}
+
+fn send_search(client: &Client, body: &Value, cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
     client
-        .post("/v1/search", &body)
+        .post("/v1/search", body)
         .map(|envelope| fmt::search_response(&envelope))
         .map_err(|error| error.render())
+}
+
+fn run_search(params: Value, cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
+    let body = prepare_search(&params)?;
+    let client = client_for(&params)?;
+    send_search(&client, &body, cancel)
 }
 
 rpi_plugin_sdk::execute_handler! {
@@ -309,47 +325,65 @@ fn collect_queries(params: &Value) -> Result<Vec<Value>, String> {
         .collect())
 }
 
-fn run_batch(params: Value, cancel: &Cancel) -> Outcome {
-    if is_cancelled(cancel) {
-        return Err("anysearch request cancelled".to_string());
-    }
-    let mut queries = collect_queries(&params)?;
-    let domain = str_field(&params, "domain");
+/// 一条已校验、可立即发出的 batch 查询。
+#[derive(Debug)]
+struct PreparedQuery {
+    label: String,
+    body: Value,
+}
+
+/// batch 参数校验 → 每条查询的请求体。不触网，因此可单测。
+fn prepare_batch(params: &Value) -> Result<Vec<PreparedQuery>, String> {
+    let mut queries = collect_queries(params)?;
+    let domain = str_field(params, "domain");
     validate_domain(domain)?;
     // 与 `run_search` 走同一个 `resolve_tag`：`tag`/`sub_domain` 不一致时必须报错，
     // 而不是让 `tag` 默默胜出。
     let tag = resolve_tag(
         domain,
-        str_field(&params, "tag"),
-        str_field(&params, "sub_domain"),
+        str_field(params, "tag"),
+        str_field(params, "sub_domain"),
     )?;
-    let shared_params = parse_params_field(&params)?;
+    let shared_params = parse_params_field(params)?;
     api::inject_shared(
         &mut queries,
         tag.as_deref(),
         shared_params.as_ref(),
-        int_field(&params, "max_results"),
+        int_field(params, "max_results"),
     );
-
-    let client = client_for(&params)?;
-    let bodies = queries
+    queries
         .iter()
-        .map(api::normalize_item)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|item| {
+            let label = item
+                .get("query")
+                .and_then(|query| query.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(PreparedQuery {
+                label,
+                body: api::normalize_item(item)?,
+            })
+        })
+        .collect()
+}
 
+/// 并发发出全部查询并按输入顺序归位;单条失败不影响其它。
+fn send_batch(client: &Client, prepared: &[PreparedQuery], cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
     // 每条查询一个线程并发发出，结果按输入顺序归位。
     let results: Vec<Result<Value, String>> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
-        for body in &bodies {
+        for item in prepared {
             let client = client.clone();
             let cancel = Arc::clone(cancel);
+            let body = item.body.clone();
             handles.push(scope.spawn(move || {
                 // 取消后不再发出剩余请求（已发出的仍会等它们返回）。
                 if is_cancelled(&cancel) {
                     return Err("anysearch request cancelled".to_string());
                 }
                 client
-                    .post("/v1/search", body)
+                    .post("/v1/search", &body)
                     .map_err(|error| error.render())
             }));
         }
@@ -364,24 +398,27 @@ fn run_batch(params: Value, cancel: &Cancel) -> Outcome {
     });
 
     let mut blocks: Vec<String> = Vec::new();
-    for (index, item) in queries.iter().enumerate() {
-        let query = item
-            .get("query")
-            .and_then(|query| query.as_str())
-            .unwrap_or("");
-        blocks.push(format!("## Query {}: {query}", index + 1));
+    for (index, item) in prepared.iter().enumerate() {
+        blocks.push(format!("## Query {}: {}", index + 1, item.label));
         blocks.push(String::new());
         match &results[index] {
             Ok(envelope) => blocks.push(fmt::search_response(envelope).trim_end().to_string()),
             Err(message) => blocks.push(fmt::batch_failure(message, "")),
         }
-        if index + 1 < queries.len() {
+        if index + 1 < prepared.len() {
             blocks.push(String::new());
             blocks.push("---".to_string());
             blocks.push(String::new());
         }
     }
     Ok(blocks.join("\n") + "\n")
+}
+
+fn run_batch(params: Value, cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
+    let prepared = prepare_batch(&params)?;
+    let client = client_for(&params)?;
+    send_batch(&client, &prepared, cancel)
 }
 
 rpi_plugin_sdk::execute_handler! {
@@ -395,16 +432,24 @@ rpi_plugin_sdk::execute_handler! {
 // extract
 // ---------------------------------------------------------------------------
 
-fn run_extract(params: Value, cancel: &Cancel) -> Outcome {
-    if is_cancelled(cancel) {
-        return Err("anysearch request cancelled".to_string());
-    }
-    let url = str_field(&params, "url").ok_or("`url` is required")?;
-    let client = client_for(&params)?;
+fn prepare_extract(params: &Value) -> Result<Value, String> {
+    let url = str_field(params, "url").ok_or("`url` is required")?;
+    Ok(json!({ "url": url }))
+}
+
+fn send_extract(client: &Client, body: &Value, cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
     client
-        .post("/v1/extract", &json!({ "url": url }))
+        .post("/v1/extract", body)
         .map(|envelope| fmt::extract_response(&envelope))
         .map_err(|error| error.render())
+}
+
+fn run_extract(params: Value, cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
+    let body = prepare_extract(&params)?;
+    let client = client_for(&params)?;
+    send_extract(&client, &body, cancel)
 }
 
 rpi_plugin_sdk::execute_handler! {
@@ -418,10 +463,7 @@ rpi_plugin_sdk::execute_handler! {
 // get_sub_domains
 // ---------------------------------------------------------------------------
 
-fn run_domains(params: Value, cancel: &Cancel) -> Outcome {
-    if is_cancelled(cancel) {
-        return Err("anysearch request cancelled".to_string());
-    }
+fn prepare_domains(params: &Value) -> Result<Vec<String>, String> {
     let mut domains: Vec<String> = Vec::new();
     if let Some(raw) = params.get("domains").filter(|value| !value.is_null()) {
         match raw {
@@ -437,7 +479,7 @@ fn run_domains(params: Value, cancel: &Cancel) -> Outcome {
         }
     }
     if domains.is_empty() {
-        if let Some(domain) = str_field(&params, "domain") {
+        if let Some(domain) = str_field(params, "domain") {
             domains.push(domain.to_string());
         }
     }
@@ -450,15 +492,26 @@ fn run_domains(params: Value, cancel: &Cancel) -> Outcome {
             "get_sub_domains supports a maximum of {MAX_DOMAINS} domains"
         ));
     }
-    let client = client_for(&params)?;
+    Ok(domains)
+}
+
+fn send_domains(client: &Client, domains: &[String], cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
     let query: Vec<(&str, String)> = domains
         .iter()
         .map(|domain| ("domain", domain.clone()))
         .collect();
     client
         .get("/v1/sub-domains", &query)
-        .map(|envelope| fmt::capabilities_response(&envelope, &domains))
+        .map(|envelope| fmt::capabilities_response(&envelope, domains))
         .map_err(|error| error.render())
+}
+
+fn run_domains(params: Value, cancel: &Cancel) -> Outcome {
+    guard(cancel)?;
+    let domains = prepare_domains(&params)?;
+    let client = client_for(&params)?;
+    send_domains(&client, &domains, cancel)
 }
 
 rpi_plugin_sdk::execute_handler! {
@@ -638,5 +691,234 @@ mod tests {
         let value: Value = serde_json::from_str(&text_result("hi")).unwrap();
         assert_eq!(value["content"][0]["type"], json!("text"));
         assert_eq!(value["content"][0]["text"], json!("hi"));
+    }
+
+    // -----------------------------------------------------------------------
+    // prepare_* : 不触网的纯校验，以前完全没测到
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prepare_search_validates_before_sending() {
+        assert_eq!(
+            prepare_search(&json!({})),
+            Err("`query` is required".to_string())
+        );
+        assert_eq!(
+            prepare_search(&json!({"query": "q", "zone": "mars"})),
+            Err("`zone` must be `cn` or `intl`".to_string())
+        );
+        assert!(prepare_search(&json!({"query": "q", "domain": "nope"})).is_err());
+
+        let body = prepare_search(&json!({
+            "query": "q",
+            "domain": "finance",
+            "sub_domain": "finance.quote",
+            "zone": "cn",
+            "language": "zh-CN",
+            "max_results": 42
+        }))
+        .unwrap();
+        assert_eq!(body["tag"], json!("finance.quote"));
+        assert_eq!(body["zone"], json!("cn"));
+        assert_eq!(body["max_results"], json!(10));
+    }
+
+    #[test]
+    fn prepare_batch_labels_every_query() {
+        let prepared = prepare_batch(&json!({"query": ["a", "b"], "tag": "code.doc"})).unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].label, "a");
+        assert_eq!(prepared[1].label, "b");
+        // 共享 tag 被注入到没有自己 tag 的条目上。
+        assert_eq!(prepared[0].body["tag"], json!("code.doc"));
+    }
+
+    #[test]
+    fn prepare_domains_accepts_every_documented_shape() {
+        assert_eq!(
+            prepare_domains(&json!({"domain": "finance"})).unwrap(),
+            vec!["finance"]
+        );
+        assert_eq!(
+            prepare_domains(&json!({"domains": "finance,health"})).unwrap(),
+            vec!["finance", "health"]
+        );
+        assert_eq!(
+            prepare_domains(&json!({"domains": ["finance", "health"]})).unwrap(),
+            vec!["finance", "health"]
+        );
+        assert_eq!(
+            prepare_domains(&json!({"domains": ["  ", "health"]})).unwrap(),
+            vec!["health"]
+        );
+        assert!(prepare_domains(&json!({})).is_err());
+        assert!(prepare_domains(&json!({"domains": 5})).is_err());
+        assert!(prepare_domains(&json!({"domains": ["a", "b", "c", "d", "e", "f"]})).is_err());
+    }
+
+    #[test]
+    fn prepare_extract_requires_a_url() {
+        assert_eq!(
+            prepare_extract(&json!({})),
+            Err("`url` is required".to_string())
+        );
+        assert_eq!(
+            prepare_extract(&json!({"url": "https://e.x"})).unwrap(),
+            json!({"url": "https://e.x"})
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // send_* : 通过注入的传输层测并发、失败隔离与取消
+    // -----------------------------------------------------------------------
+
+    /// 按请求体里的 query 回放响应，记录收到的 query 顺序。
+    fn search_transport(
+        answer: impl Fn(&str) -> Result<api::Response, api::ApiError> + Send + Sync + 'static,
+    ) -> (std::sync::Arc<api::testing::FakeTransport>, Client) {
+        let fake = api::testing::FakeTransport::new(move |request| {
+            let body: Value =
+                serde_json::from_str(request.body.as_deref().unwrap_or("")).unwrap_or(Value::Null);
+            answer(body["query"].as_str().unwrap_or(""))
+        });
+        let client = fake.client("");
+        (fake, client)
+    }
+
+    fn envelope(query: &str) -> api::Response {
+        api::Response {
+            status: 200,
+            body: json!({
+                "code": 0,
+                "data": {
+                    "results": [{"title": query, "url": "https://e.x", "content": "c"}],
+                    "metadata": {"total_results": 1, "search_time_ms": 1}
+                }
+            })
+            .to_string(),
+        }
+    }
+
+    fn prepared(labels: &[&str]) -> Vec<PreparedQuery> {
+        labels
+            .iter()
+            .map(|label| PreparedQuery {
+                label: (*label).to_string(),
+                body: json!({"query": label}),
+            })
+            .collect()
+    }
+
+    fn no_cancel() -> Cancel {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    #[test]
+    fn batch_results_keep_input_order() {
+        // 第一条故意比后来的慢：归位靠索引而不是完成顺序。
+        let (_, client) = search_transport(|query| {
+            if query == "slow" {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            Ok(envelope(query))
+        });
+        let text = send_batch(&client, &prepared(&["slow", "fast"]), &no_cancel()).unwrap();
+        let slow = text.find("## Query 1: slow").expect("first block");
+        let fast = text.find("## Query 2: fast").expect("second block");
+        assert!(slow < fast, "{text}");
+        assert!(text.contains("### 1. slow"), "{text}");
+        assert!(text.contains("### 1. fast"), "{text}");
+    }
+
+    #[test]
+    fn batch_failure_does_not_affect_other_queries() {
+        let (_, client) = search_transport(|query| {
+            if query == "bad" {
+                Err(api::ApiError::new("boom"))
+            } else {
+                Ok(envelope(query))
+            }
+        });
+        let text = send_batch(&client, &prepared(&["bad", "good"]), &no_cancel()).unwrap();
+        assert!(text.contains("## Query 1: bad"), "{text}");
+        assert!(text.contains("Search failed: boom"), "{text}");
+        assert!(text.contains("## Query 2: good"), "{text}");
+        // 成功的那条仍然渲染出搜索结果，而不是被失败拖垮。
+        assert!(text.contains("## Search Results"), "{text}");
+    }
+
+    #[test]
+    fn cancelled_batch_sends_nothing() {
+        let (fake, client) = search_transport(|query| Ok(envelope(query)));
+        let cancel: Cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let error = send_batch(&client, &prepared(&["a", "b"]), &cancel).unwrap_err();
+        assert_eq!(error, "anysearch request cancelled");
+        // 取消是入口守卫:一个请求都不应该发出去。
+        assert!(fake.requests().is_empty());
+    }
+
+    #[test]
+    fn send_search_carries_the_request_shape() {
+        let (fake, client) = search_transport(|query| Ok(envelope(query)));
+        let body = json!({"query": "rust"});
+        let text = send_search(&client, &body, &no_cancel()).unwrap();
+        assert!(text.starts_with("## Search Results"), "{text}");
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/v1/search");
+        assert_eq!(requests[0].method, api::Method::Post);
+    }
+
+    #[test]
+    fn send_domains_asks_once_per_domain() {
+        let fake = api::testing::FakeTransport::new(|_| {
+            Ok(api::Response {
+                status: 200,
+                body: json!({"code": 0, "data": {"domains": [
+                    {"domain": "finance", "sub_domains": [{"sub_domain": "finance.quote"}]}
+                ]}})
+                .to_string(),
+            })
+        });
+        let client = fake.client("");
+        let domains = vec!["finance".to_string(), "health".to_string()];
+        let text = send_domains(&client, &domains, &no_cancel()).unwrap();
+        assert!(text.contains("## finance Domain Capabilities"), "{text}");
+        let requests = fake.requests();
+        assert_eq!(requests[0].method, api::Method::Get);
+        assert_eq!(requests[0].path, "/v1/sub-domains");
+        // 多个 domain 用重复的 `domain` 参数,而不是逗号拼接。
+        assert_eq!(requests[0].query.len(), 2);
+        assert_eq!(requests[0].query[1].1, "health");
+    }
+
+    #[test]
+    fn send_extract_warns_about_untrusted_content() {
+        let (fake, client) = search_transport(|_| {
+            Ok(api::Response {
+                status: 200,
+                body: json!({"code": 0, "data": {"title": "T", "url": "https://e.x", "content": "hi"}})
+                    .to_string(),
+            })
+        });
+        let text = send_extract(&client, &json!({"url": "https://e.x"}), &no_cancel()).unwrap();
+        assert!(
+            text.starts_with("> **External page content (untrusted):**"),
+            "{text}"
+        );
+        assert_eq!(fake.requests()[0].path, "/v1/extract");
+    }
+
+    #[test]
+    fn http_error_from_the_api_surfaces_as_text() {
+        let (_, client) = search_transport(|_| {
+            Ok(api::Response {
+                status: 200,
+                body: json!({"code": 4001, "message": "bad tag", "request_id": "req_1"})
+                    .to_string(),
+            })
+        });
+        let error = send_search(&client, &json!({"query": "q"}), &no_cancel()).unwrap_err();
+        assert_eq!(error, "bad tag (request_id: req_1)");
     }
 }
