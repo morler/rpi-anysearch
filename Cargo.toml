@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/morler/rpi-anysearch"
 keywords = ["rpi", "anysearch", "search", "extension", "agent"]
 categories = ["development-tools"]
-include = ["src/**/*.rs", "assets/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [lib]
 # cdylib for the host loader; rlib so `cargo test` can link the modules.
@@ -24,6 +24,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [profile.release]
 lto = "thin"
-# Keep symbol names: the artifact is loaded into the host process, and a panic
-# inside the plugin is otherwise impossible to read.
+# Keep the symbol table so a panic inside the loaded plugin shows named frames.
+# Note this still drops DWARF line tables: set `debug = 1` (or `strip = "none"`)
+# if source locations in backtraces matter more than artifact size.
 strip = "debuginfo"

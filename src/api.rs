@@ -6,6 +6,9 @@ use serde_json::{json, Map, Value};
 use std::fmt;
 use std::time::Duration;
 
+/// 响应体读取上限:防止恶意/异常响应耗尽宿主内存。
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub message: String,
@@ -44,6 +47,8 @@ impl fmt::Display for ApiError {
     }
 }
 
+impl std::error::Error for ApiError {}
+
 #[derive(Clone)]
 pub struct Client {
     agent: ureq::Agent,
@@ -66,16 +71,21 @@ impl Client {
     }
 
     /// 从 `.env`/环境变量构造客户端;`base_url`/`api_key` 为工具参数覆盖值。
+    ///
+    /// 继承自环境的 key 不会发往非官方 endpoint(见 [`env::Settings::allows_auth`])。
     pub fn from_env(
         cwd_hint: Option<&str>,
         api_key_flag: Option<&str>,
         base_url_flag: Option<&str>,
-    ) -> Self {
-        let settings = env::load_env(cwd_hint);
-        Self::new(
-            &env::base_url(&settings, base_url_flag),
-            &env::api_key(&settings, api_key_flag),
-        )
+    ) -> Result<Self, ApiError> {
+        let settings =
+            env::resolve(cwd_hint, api_key_flag, base_url_flag).map_err(ApiError::new)?;
+        let api_key = if settings.allows_auth() {
+            settings.api_key.as_str()
+        } else {
+            ""
+        };
+        Ok(Self::new(&settings.base_url, api_key))
     }
 
     pub fn post(&self, path: &str, payload: &Value) -> Result<Value, ApiError> {
@@ -88,7 +98,8 @@ impl Client {
         if !self.api_key.is_empty() {
             request = request.header("Authorization", format!("Bearer {}", self.api_key));
         }
-        let body = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+        let body = serde_json::to_string(payload)
+            .map_err(|error| ApiError::new(format!("Failed to serialize request body: {error}")))?;
         finish(request.send(body.as_bytes()))
     }
 
@@ -123,10 +134,16 @@ fn finish(
         }
     };
     let status = response.status().as_u16();
-    let mut body = response.into_body();
-    let text = body
+    let text = response
+        .into_body()
+        .into_with_config()
+        .limit(MAX_RESPONSE_BYTES)
         .read_to_string()
-        .map_err(|_| ApiError::new("Connection Error: unable to read the response body."))?;
+        .map_err(|error| {
+            ApiError::new(format!(
+                "Connection Error: unable to read the response body ({error})."
+            ))
+        })?;
     parse_envelope(status, &text)
 }
 
@@ -145,10 +162,16 @@ fn parse_envelope(status: u16, text: &str) -> Result<Value, ApiError> {
             "Invalid API response (HTTP {status})."
         )));
     };
-    let code = object
-        .get("code")
-        .and_then(|code| code.as_i64())
-        .unwrap_or(0);
+    // `code` 缺失按 0 处理;存在但不是整数则必须报错——否则 HTTP 200 信封里的
+    // 应用层错误("4001")会被当成成功吞掉。
+    let code = match object.get("code") {
+        None | Some(Value::Null) => 0,
+        Some(code) => code.as_i64().ok_or_else(|| {
+            ApiError::new(format!(
+                "Invalid API response (HTTP {status}): `code` is not an integer ({code})."
+            ))
+        })?,
+    };
     if status >= 400 || code != 0 {
         let message = object
             .get("message")
@@ -220,18 +243,28 @@ pub fn normalize_item(item: &Value) -> Result<Value, String> {
         .get("params")
         .or_else(|| object.get("sub_domain_params"))
     {
-        match raw.as_str() {
-            Some(text) => Some(
-                env::parse_params(text)
-                    .ok_or_else(|| "params must be valid JSON or key=value pairs".to_string())?,
-            ),
-            None => Some(raw.clone()),
-        }
-        .filter(|params| !env::is_falsy(params))
+        Some(match raw {
+            Value::String(text) => env::parse_params(text)?,
+            Value::Object(map) if !map.is_empty() => raw.clone(),
+            Value::Null => Value::Null,
+            other => {
+                return Err(format!(
+                    "`params` must be an object or a key=value string, got {other}"
+                ))
+            }
+        })
+        .filter(|params| !params.is_null())
     } else {
         None
     };
-    let max_results = object.get("max_results").and_then(|value| value.as_i64());
+    let max_results = match object.get("max_results") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .ok_or_else(|| format!("`max_results` must be an integer, got {value}"))?,
+        ),
+    };
     Ok(search_body(
         query,
         tag,
@@ -274,10 +307,12 @@ pub fn inject_shared(
     }
 }
 
+/// 字段是否"由条目自己给出"。只看 key 是否存在(忽略 `null`),这样
+/// 显式的 `"max_results": 0` 或 `"tag": ""` 不会被共享值覆盖,由后续校验报错。
 fn present(object: &Map<String, Value>, key: &str) -> bool {
     object
         .get(key)
-        .map(|value| !env::is_falsy(value))
+        .map(|value| !value.is_null())
         .unwrap_or(false)
 }
 
@@ -342,5 +377,29 @@ mod tests {
         assert_eq!(err.message, "bad tag");
         assert_eq!(err.request_id, "req_1");
         assert!(err.render().contains("request_id: req_1"));
+    }
+
+    /// 真实 API 冒烟测试：`cargo test -- --ignored` 才跑，需要 ANYSEARCH_API_KEY。
+    ///
+    /// 覆盖修复后才可能出问题的路径：`resolve` 的 key 来源、`allows_auth`、
+    /// 响应体积上限、`parse_envelope` 的宽松 `code` 处理。
+    #[test]
+    #[ignore = "hits the live AnySearch API"]
+    fn live_search_and_extract() {
+        let client = Client::from_env(None, None, None).expect("resolve settings");
+        let body = search_body("rust programming language", None, None, None, None, Some(2));
+        let envelope = client.post("/v1/search", &body).expect("live search");
+        let text = crate::fmt::search_response(&envelope);
+        assert!(text.starts_with("## Search Results"), "{text}");
+        assert!(
+            !text.contains("Invalid response"),
+            "envelope shape changed: {text}"
+        );
+
+        let caps = client
+            .get("/v1/sub-domains", &[("domain", "finance".to_string())])
+            .expect("live sub-domains");
+        let text = crate::fmt::capabilities_response(&caps, &["finance".to_string()]);
+        assert!(text.contains("## finance Domain Capabilities"), "{text}");
     }
 }

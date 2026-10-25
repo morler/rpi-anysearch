@@ -22,6 +22,12 @@ use crate::fmt;
 // ---------------------------------------------------------------------------
 
 type Outcome = Result<String, String>;
+/// 取消标记（在途请求可随时读取）。
+type Cancel = Arc<std::sync::atomic::AtomicBool>;
+
+fn is_cancelled(cancel: &std::sync::atomic::AtomicBool) -> bool {
+    cancel.load(std::sync::atomic::Ordering::Acquire)
+}
 
 struct Job {
     outcome: Arc<Mutex<Option<Outcome>>>,
@@ -30,10 +36,12 @@ struct Job {
 static JOBS: ToolHandles<Job> = ToolHandles::new();
 
 /// 起一个工作线程执行 `work`，把结果写回 handle 的状态。
-fn spawn_job(work: impl FnOnce() -> Outcome + Send + 'static) -> StepHandle {
+///
+/// `work` 会拿到取消标记，长任务（batch）可以在每个请求前检查它。
+fn spawn_job(work: impl FnOnce(Cancel) -> Outcome + Send + 'static) -> StepHandle {
     let outcome: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&outcome);
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled: Cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = Arc::clone(&cancelled);
     let handle = JOBS.insert_with_cancel(
         Job {
@@ -44,19 +52,26 @@ fn spawn_job(work: impl FnOnce() -> Outcome + Send + 'static) -> StepHandle {
     let spawned = std::thread::Builder::new()
         .name("anysearch-request".to_string())
         .spawn(move || {
-            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            if is_cancelled(&flag) {
                 return;
             }
-            let result = work();
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(result);
+            let work_flag = Arc::clone(&flag);
+            // `work` 里的任何 panic 都必须变成终止态错误：否则结果槽位永远为
+            // `None`，宿主会无限轮询，`JOBS` 里的条目也一起泄漏。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(work_flag)))
+                .unwrap_or_else(|_| Err("anysearch worker panicked".to_string()));
+            match slot.lock() {
+                Ok(mut guard) => *guard = Some(result),
+                // 槽位 Mutex 被 poison：放弃写入，poll 会看到 pending；但至少
+                // 不会把 panic 继续向外传播。
+                Err(_) => eprintln!("anysearch: result slot was poisoned; dropping the outcome"),
             }
         });
     if let Err(error) = spawned {
         // 线程创建失败：直接把错误塞进结果槽位，poll 会立即返回它。
         if let Some(entry) = JOBS.get(handle) {
             if let Ok(mut guard) = entry.lock().outcome.lock() {
-                *guard = Some(Err(format!("failed to spawn search worker: {error}")));
+                *guard = Some(Err(format!("failed to spawn anysearch worker: {error}")));
             }
         }
     }
@@ -78,12 +93,14 @@ fn poll_job(
             "anysearch request cancelled".to_string(),
         ));
     }
+    // 不能 `take()`：结果一旦被取走，重复/并发的 poll 会退回 Pending 把步骤卡住。
+    // 克隆的成本可以忽略（结果本来就不大），终止态因此可重复读取。
     let outcome = entry
         .lock()
         .outcome
         .lock()
         .ok()
-        .and_then(|mut slot| slot.take());
+        .and_then(|slot| slot.clone());
     match outcome {
         None => StepResult::pending(StbString::empty()),
         Some(Ok(text)) => StepResult::done(StbString::from_string(text_result(&text))),
@@ -96,6 +113,8 @@ extern "C" fn cancel_job(handle: StepHandle) {
 }
 
 extern "C" fn destroy_job(handle: StepHandle) {
+    // 先置取消标记再移除：否则在途请求会继续跑到 30s 超时。
+    JOBS.cancel(handle);
     drop(JOBS.remove(handle));
 }
 
@@ -133,14 +152,14 @@ fn host_cwd(params: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn client_for(params: &Value) -> Client {
+fn client_for(params: &Value) -> Result<Client, String> {
     Client::from_env(
         host_cwd(params).as_deref(),
         str_field(params, "api_key"),
         str_field(params, "base_url"),
     )
+    .map_err(|error| error.render())
 }
-
 // ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------
@@ -171,24 +190,32 @@ fn resolve_tag(
 fn parse_params_field(params: &Value) -> Result<Option<Value>, String> {
     match params.get("params") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => env::parse_params(text)
-            .map(Some)
-            .ok_or_else(|| "`params` must be valid JSON or key=value pairs".to_string()),
-        Some(other) => Ok(Some(other.clone()).filter(|value| !env::is_falsy(value))),
+        Some(Value::String(text)) => env::parse_params(text).map(Some),
+        Some(Value::Object(map)) if !map.is_empty() => Ok(Some(params["params"].clone())),
+        Some(other) => Err(format!(
+            "`params` must be an object or a key=value string, got {other}"
+        )),
     }
 }
 
-fn run_search(params: Value) -> Outcome {
+/// `domain` 必须在 [`crate::consts::DOMAINS`] 内（两个工具共用同一套校验）。
+fn validate_domain(domain: Option<&str>) -> Result<(), String> {
+    match domain {
+        Some(domain) if !crate::consts::DOMAINS.contains(&domain) => Err(format!(
+            "unknown domain `{domain}`; expected one of: {}",
+            crate::consts::DOMAINS.join(", ")
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn run_search(params: Value, cancel: &Cancel) -> Outcome {
+    if is_cancelled(cancel) {
+        return Err("anysearch request cancelled".to_string());
+    }
     let query = str_field(&params, "query").ok_or("`query` is required")?;
     let domain = str_field(&params, "domain");
-    if let Some(domain) = domain {
-        if !crate::consts::DOMAINS.contains(&domain) {
-            return Err(format!(
-                "unknown domain `{domain}`; expected one of: {}",
-                crate::consts::DOMAINS.join(", ")
-            ));
-        }
-    }
+    validate_domain(domain)?;
     let tag = resolve_tag(
         domain,
         str_field(&params, "tag"),
@@ -209,7 +236,7 @@ fn run_search(params: Value) -> Outcome {
         str_field(&params, "language"),
         int_field(&params, "max_results"),
     );
-    let client = client_for(&params);
+    let client = client_for(&params)?;
     client
         .post("/v1/search", &body)
         .map(|envelope| fmt::search_response(&envelope))
@@ -219,7 +246,7 @@ fn run_search(params: Value) -> Outcome {
 rpi_plugin_sdk::execute_handler! {
     fn search_execute(_tool_call_id, params) {
         let parsed: Value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
-        spawn_job(move || run_search(parsed))
+        spawn_job(move |cancel| run_search(parsed, &cancel))
     }
 }
 
@@ -275,17 +302,20 @@ fn collect_queries(params: &Value) -> Result<Vec<Value>, String> {
         .collect())
 }
 
-fn run_batch(params: Value) -> Outcome {
+fn run_batch(params: Value, cancel: &Cancel) -> Outcome {
+    if is_cancelled(cancel) {
+        return Err("anysearch request cancelled".to_string());
+    }
     let mut queries = collect_queries(&params)?;
     let domain = str_field(&params, "domain");
-    let mut tag = str_field(&params, "tag")
-        .or_else(|| str_field(&params, "sub_domain"))
-        .map(str::to_string);
-    if let Some(domain) = domain {
-        if let Some(resolved) = resolve_tag(Some(domain), tag.as_deref(), None)? {
-            tag = Some(resolved);
-        }
-    }
+    validate_domain(domain)?;
+    // 与 `run_search` 走同一个 `resolve_tag`：`tag`/`sub_domain` 不一致时必须报错，
+    // 而不是让 `tag` 默默胜出。
+    let tag = resolve_tag(
+        domain,
+        str_field(&params, "tag"),
+        str_field(&params, "sub_domain"),
+    )?;
     let shared_params = parse_params_field(&params)?;
     api::inject_shared(
         &mut queries,
@@ -294,7 +324,7 @@ fn run_batch(params: Value) -> Outcome {
         int_field(&params, "max_results"),
     );
 
-    let client = client_for(&params);
+    let client = client_for(&params)?;
     let bodies = queries
         .iter()
         .map(api::normalize_item)
@@ -305,7 +335,12 @@ fn run_batch(params: Value) -> Outcome {
         let mut handles = Vec::new();
         for body in &bodies {
             let client = client.clone();
+            let cancel = Arc::clone(cancel);
             handles.push(scope.spawn(move || {
+                // 取消后不再发出剩余请求（已发出的仍会等它们返回）。
+                if is_cancelled(&cancel) {
+                    return Err("anysearch request cancelled".to_string());
+                }
                 client
                     .post("/v1/search", body)
                     .map_err(|error| error.render())
@@ -345,7 +380,7 @@ fn run_batch(params: Value) -> Outcome {
 rpi_plugin_sdk::execute_handler! {
     fn batch_execute(_tool_call_id, params) {
         let parsed: Value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
-        spawn_job(move || run_batch(parsed))
+        spawn_job(move |cancel| run_batch(parsed, &cancel))
     }
 }
 
@@ -353,9 +388,12 @@ rpi_plugin_sdk::execute_handler! {
 // extract
 // ---------------------------------------------------------------------------
 
-fn run_extract(params: Value) -> Outcome {
+fn run_extract(params: Value, cancel: &Cancel) -> Outcome {
+    if is_cancelled(cancel) {
+        return Err("anysearch request cancelled".to_string());
+    }
     let url = str_field(&params, "url").ok_or("`url` is required")?;
-    let client = client_for(&params);
+    let client = client_for(&params)?;
     client
         .post("/v1/extract", &json!({ "url": url }))
         .map(|envelope| fmt::extract_response(&envelope))
@@ -365,7 +403,7 @@ fn run_extract(params: Value) -> Outcome {
 rpi_plugin_sdk::execute_handler! {
     fn extract_execute(_tool_call_id, params) {
         let parsed: Value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
-        spawn_job(move || run_extract(parsed))
+        spawn_job(move |cancel| run_extract(parsed, &cancel))
     }
 }
 
@@ -373,7 +411,10 @@ rpi_plugin_sdk::execute_handler! {
 // get_sub_domains
 // ---------------------------------------------------------------------------
 
-fn run_domains(params: Value) -> Outcome {
+fn run_domains(params: Value, cancel: &Cancel) -> Outcome {
+    if is_cancelled(cancel) {
+        return Err("anysearch request cancelled".to_string());
+    }
     let mut domains: Vec<String> = Vec::new();
     if let Some(raw) = params.get("domains").filter(|value| !value.is_null()) {
         match raw {
@@ -402,7 +443,7 @@ fn run_domains(params: Value) -> Outcome {
             "get_sub_domains supports a maximum of {MAX_DOMAINS} domains"
         ));
     }
-    let client = client_for(&params);
+    let client = client_for(&params)?;
     let query: Vec<(&str, String)> = domains
         .iter()
         .map(|domain| ("domain", domain.clone()))
@@ -416,7 +457,7 @@ fn run_domains(params: Value) -> Outcome {
 rpi_plugin_sdk::execute_handler! {
     fn domains_execute(_tool_call_id, params) {
         let parsed: Value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
-        spawn_job(move || run_domains(parsed))
+        spawn_job(move |cancel| run_domains(parsed, &cancel))
     }
 }
 

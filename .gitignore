@@ -1,19 +1,32 @@
-# Build output at any depth: a future workspace or an example crate brings its
-# own `target/`.
+# Build output. `target/` already matches the directory at any depth, so the
+# `**/target/` duplicate was removed.
 target/
-**/target/
 
 # A shipped cdylib must be reproducible: `rpi-plugin-sdk = "0.8"` is a caret
 # requirement, so the lockfile stays tracked on purpose. Do not add `Cargo.lock`
 # to this file.
 
-# Local agent state (sessions, dev-loaded extension binaries).
+# Local agent state (sessions, dev-loaded extension binaries). `.rpi/` covers
+# any depth; there is no root-only exception.
 .rpi/
-**/.rpi/
 
 # Local/secret and editor/OS artifacts.
 .env
 .env.*
+# ...but the documented templates are meant to be committed.
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+.direnv/
+secrets/
+*.pem
+*.key
+*.p12
+*.log
+credentials.json
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
+*.swp

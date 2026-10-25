@@ -91,7 +91,8 @@ rpi uninstall rpi-anysearch              # 卸载
 
 ```bash
 cargo build                    # cdylib 给宿主，rlib 给测试
-cargo test                     # 17 个纯函数单测，不需要宿主也不需要 key
+cargo test                     # 34 个单测，不需要宿主也不需要 key
+cargo test -- --ignored        # 另 1 个真实 API 冒烟测试（需要 ANYSEARCH_API_KEY）
 cargo fmt --check && cargo clippy --all-targets
 rpi dev --no-watch             # 编译加载一次
 rpi install --path . --force   # 干净安装路径

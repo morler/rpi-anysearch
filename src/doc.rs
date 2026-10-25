@@ -2,25 +2,37 @@
 
 use crate::consts::{DOMAINS, MAX_BATCH_QUERIES, MAX_DOMAINS};
 
+/// 完整的领域数量（`DOMAINS` 含 `general`）。
+pub const DOMAIN_COUNT: usize = DOMAINS.len();
+
+/// 垂直领域数量（不含 `general`）。
+pub const VERTICAL_DOMAIN_COUNT: usize = DOMAIN_COUNT - 1;
+
 /// 完整接口参考（离线，不发网络请求）。
 pub fn render() -> String {
-    SPEC.replace("{{DOMAINS_SPACE}}", &DOMAINS.join(" "))
-        .replace("{{MAX_BATCH}}", &MAX_BATCH_QUERIES.to_string())
-        .replace("{{MAX_DOMAINS}}", &MAX_DOMAINS.to_string())
+    substitute(SPEC)
 }
 
 /// 分发给 rpi 技能的 SKILL.md：frontmatter + 工具化的用法说明。
 pub fn skill_markdown() -> String {
-    format!(
-        "{FRONTMATTER}\n{BODY}\n",
-        FRONTMATTER = FRONTMATTER,
-        BODY = render()
-    )
+    format!("{}\n{}\n", substitute(FRONTMATTER), render())
+}
+
+/// 替换所有占位符（frontmatter 和正文共用同一套）。
+fn substitute(template: &str) -> String {
+    template
+        .replace(
+            "{{VERTICAL_DOMAIN_COUNT}}",
+            &VERTICAL_DOMAIN_COUNT.to_string(),
+        )
+        .replace("{{DOMAINS_SPACE}}", &DOMAINS.join(" "))
+        .replace("{{MAX_BATCH}}", &MAX_BATCH_QUERIES.to_string())
+        .replace("{{MAX_DOMAINS}}", &MAX_DOMAINS.to_string())
 }
 
 const FRONTMATTER: &str = r#"---
 name: anysearch
-description: Real-time web search (general + 17 vertical domains), parallel batch search and URL-to-Markdown extraction through the AnySearch API. Use when a task needs current facts, news, documentation, page contents beyond a snippet, or structured domain data (finance quotes, academic papers, legal cases, code docs, CVEs, patents, travel, health, ...).
+description: Real-time web search (general + {{VERTICAL_DOMAIN_COUNT}} vertical domains), parallel batch search and URL-to-Markdown extraction through the AnySearch API. Use when a task needs current facts, news, documentation, page contents beyond a snippet, or structured domain data (finance quotes, academic papers, legal cases, code docs, CVEs, patents, travel, health, ...).
 ---"#;
 
 const SPEC: &str = r#"# AnySearch Tools
@@ -58,8 +70,11 @@ marked `(required)`. Cache the answer per domain within a session — do not cal
 ### `anysearch_batch_search` — up to {{MAX_BATCH}} queries in parallel
 
 Arguments: `queries` (array of `{query, tag, sub_domain, params, zone, language, max_results}`;
-plain strings are accepted) or `query` (one query or an array), plus the shared `tag`/`domain`/
-`sub_domain`/`params`/`max_results` that are injected into items lacking their own value.
+plain strings are accepted) or `query` (one query or an array), plus the shared `tag`/`sub_domain`/
+`params`/`max_results` that are injected into items lacking their own value. `query` is a fallback
+for a flat list of queries: when both are given they are **merged** into one batch (still capped at
+{{MAX_BATCH}}). The shared `domain` is a validator, not an injected field: it must be the prefix of
+the shared `tag`/`sub_domain`, and it is rejected when neither is given.
 Results stay in input order; a single failure does not block the others.
 
 ### `anysearch_extract` — page content as Markdown
@@ -96,9 +111,22 @@ mod tests {
     #[test]
     fn render_substitutes_placeholders() {
         let text = render();
-        assert!(!text.contains("{{"));
-        assert!(text.contains("gaming"));
-        assert!(text.contains("up to 5 queries"));
+        assert!(!text.contains("{{") && !text.contains("}}"));
+        assert!(text.contains(DOMAINS[DOMAINS.len() - 1]));
+        assert!(text.contains(&format!("up to {MAX_BATCH_QUERIES} queries")));
+        assert!(text.contains(&format!("up to {MAX_DOMAINS},")));
+    }
+
+    #[test]
+    fn frontmatter_derives_the_domain_count() {
+        let text = skill_markdown();
+        assert!(!text.contains("{{") && !text.contains("}}"));
+        assert!(
+            text.contains(&format!(
+                "general + {VERTICAL_DOMAIN_COUNT} vertical domains"
+            )),
+            "{text}"
+        );
     }
 
     #[test]
